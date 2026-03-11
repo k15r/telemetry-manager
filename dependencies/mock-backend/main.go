@@ -57,7 +57,6 @@ func httpToGRPCStatus(httpCode int) int {
 type rule struct {
 	statusCode int
 	percentage float64
-	delayMS    int // milliseconds to sleep before responding; 0 means no delay
 }
 
 type stats struct {
@@ -125,7 +124,7 @@ func newStats(rules []rule, defaultBehavior string) *stats {
 func main() {
 	log.SetPrefix(fmt.Sprintf("[%s] ", "mock-backend"))
 
-	rules, defaultBehavior, defaultDelayMS := parseConfig()
+	rules, defaultBehavior := parseConfig()
 	reqStats := newStats(rules, defaultBehavior)
 
 	go func() {
@@ -137,7 +136,7 @@ func main() {
 		}
 	}()
 
-	handler := buildHandler(rules, defaultBehavior, defaultDelayMS, reqStats)
+	handler := buildHandler(rules, defaultBehavior, reqStats)
 
 	ports := []string{":4317", ":4318", ":9880"}
 
@@ -170,7 +169,7 @@ func main() {
 	wg.Wait()
 }
 
-func parseConfig() ([]rule, string, int) {
+func parseConfig() ([]rule, string) {
 	rulesEnv := os.Getenv("FAULT_RULES")
 
 	defaultBehavior := os.Getenv("FAULT_DEFAULT")
@@ -183,9 +182,6 @@ func parseConfig() ([]rule, string, int) {
 			log.Fatalf("FAULT_DEFAULT must be a status code or 'close', got: %s", defaultBehavior) //nolint:gosec // env var value is safe to log
 		}
 	}
-
-	// Parse per-status-code delays: FAULT_DELAYS=400:500,200:1000 (statusCode:delayMs)
-	delays := parseDelays(os.Getenv("FAULT_DELAYS"))
 
 	var rules []rule
 
@@ -208,7 +204,7 @@ func parseConfig() ([]rule, string, int) {
 				log.Fatalf("Invalid percentage in rule %s: %v", entry, err) //nolint:gosec // env var value is safe to log
 			}
 
-			rules = append(rules, rule{statusCode: statusCode, percentage: percentage, delayMS: delays[statusCode]})
+			rules = append(rules, rule{statusCode: statusCode, percentage: percentage})
 			totalPercentage += percentage
 		}
 
@@ -223,50 +219,7 @@ func parseConfig() ([]rule, string, int) {
 		log.Printf("No fault rules configured, all requests use default: %s", defaultBehavior) //nolint:gosec // env var value is safe to log
 	}
 
-	if len(delays) > 0 {
-		log.Printf("Delays: %s", os.Getenv("FAULT_DELAYS")) //nolint:gosec // env var value is safe to log
-	}
-
-	// Look up the delay for the default behavior status code (if any).
-	var defaultDelayMS int
-
-	if defaultBehavior != "close" {
-		if code, err := strconv.Atoi(defaultBehavior); err == nil {
-			defaultDelayMS = delays[code]
-		}
-	}
-
-	return rules, defaultBehavior, defaultDelayMS
-}
-
-// parseDelays parses FAULT_DELAYS env var: "400:500,200:1000" → map[statusCode]delayMs.
-func parseDelays(env string) map[int]int {
-	delays := make(map[int]int)
-
-	if env == "" {
-		return delays
-	}
-
-	for entry := range strings.SplitSeq(env, ",") {
-		parts := strings.SplitN(strings.TrimSpace(entry), ":", ruleParts)
-		if len(parts) != ruleParts {
-			log.Fatalf("Invalid delay format: %s, expected statusCode:delayMs", entry) //nolint:gosec // env var value is safe to log
-		}
-
-		statusCode, err := strconv.Atoi(strings.TrimSpace(parts[0]))
-		if err != nil {
-			log.Fatalf("Invalid status code in delay: %s: %v", entry, err) //nolint:gosec // env var value is safe to log
-		}
-
-		delayMS, err := strconv.Atoi(strings.TrimSpace(parts[1]))
-		if err != nil {
-			log.Fatalf("Invalid delay ms in delay: %s: %v", entry, err) //nolint:gosec // env var value is safe to log
-		}
-
-		delays[statusCode] = delayMS
-	}
-
-	return delays
+	return rules, defaultBehavior
 }
 
 func isGRPC(r *http.Request) bool {
@@ -302,11 +255,10 @@ func writeGRPCResponse(w http.ResponseWriter, httpCode int) {
 	h.Set(http.TrailerPrefix+"Grpc-Status", grpcStatus)
 }
 
-func buildHandler(rules []rule, defaultBehavior string, defaultDelayMS int, reqStats *stats) http.Handler {
+func buildHandler(rules []rule, defaultBehavior string, reqStats *stats) http.Handler {
 	type threshold struct {
 		cumulative float64
 		statusCode int
-		delayMS    int
 	}
 
 	thresholds := make([]threshold, 0, len(rules))
@@ -314,7 +266,7 @@ func buildHandler(rules []rule, defaultBehavior string, defaultDelayMS int, reqS
 	var cumulative float64
 	for _, r := range rules {
 		cumulative += r.percentage
-		thresholds = append(thresholds, threshold{cumulative: cumulative, statusCode: r.statusCode, delayMS: r.delayMS})
+		thresholds = append(thresholds, threshold{cumulative: cumulative, statusCode: r.statusCode})
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -327,10 +279,6 @@ func buildHandler(rules []rule, defaultBehavior string, defaultDelayMS int, reqS
 
 		for _, t := range thresholds {
 			if roll < t.cumulative {
-				if t.delayMS > 0 {
-					time.Sleep(time.Duration(t.delayMS) * time.Millisecond)
-				}
-
 				respond(w, r, t.statusCode)
 				reqStats.record(t.statusCode)
 
@@ -361,10 +309,6 @@ func buildHandler(rules []rule, defaultBehavior string, defaultDelayMS int, reqS
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
-		}
-
-		if defaultDelayMS > 0 {
-			time.Sleep(time.Duration(defaultDelayMS) * time.Millisecond)
 		}
 
 		respond(w, r, code)
